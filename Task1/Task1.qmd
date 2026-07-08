@@ -1,0 +1,143 @@
+---
+title: "Model validation task"
+author: "Jakub Szamik"
+format: html
+editor: visual
+---
+
+```{r,include=FALSE}
+library(tidymodels)
+library(modeldata)
+library(tidyverse)
+library(vip)
+```
+
+```{r}
+set.seed(2026)
+
+data("biomass")
+
+biomass_clean <- biomass %>% 
+  select(-sample, -dataset)
+
+data_split <- initial_split(biomass_clean, prop = 0.80, strata = HHV)
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+cv_folds <- vfold_cv(train_data, v = 5, repeats = 2, strata = HHV)
+```
+
+**Data Preparation Commentary:**
+The dataset was cleaned by dropping `sample` and `dataset` columns, which served merely as identifiers. Retaining them would lead to severe target leakage or factorization issues during training. Stratified splitting (`strata = HHV`) ensures an identical target distribution across both train/test partitions and the 5-fold (2 repeats) cross-validation splits, preserving variance consistency.
+
+```{r}
+base_rec <- recipe(HHV ~ ., data = train_data) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_zv(all_predictors())
+
+lm_rec <- base_rec %>%
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+svm_rec <- base_rec %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_pca(all_numeric_predictors(), threshold = 0.95)
+
+mars_rec <- base_rec
+rf_rec <- base_rec
+```
+
+**Feature Engineering Commentary:**
+Different architectures impose distinct assumptions on data. Linear Regression requires the fixing of skewed predictors via a `YeoJohnson` transformation and feature scaling. SVM uses `PCA` to handle collinearity and reduce feature dimensions while retaining 95% of the total variance. Tree-based structures like MARS and Random Forest are naturally scale-invariant and handle non-linear raw distributions out-of-the-box.
+
+```{r}
+lm_spec   <- linear_reg() %>% set_engine("lm")
+svm_spec  <- svm_rbf(cost = 1, rbf_sigma = 0.1) %>% set_mode("regression") %>% set_engine("kernlab")
+mars_spec <- mars(num_terms = 10) %>% set_mode("regression") %>% set_engine("earth")
+rf_spec   <- rand_forest(trees = 500) %>% set_mode("regression") %>% set_engine("ranger")
+
+model_pipelines <- workflow_set(
+  preproc = list(
+    Linear_Reg = lm_rec,
+    SVM_RBF    = svm_rec,
+    MARS       = mars_rec,
+    Random_Forest = rf_rec
+  ),
+  models = list(
+    lm = lm_spec,
+    svm = svm_spec,
+    mars = mars_spec,
+    rf = rf_spec
+  ),
+  cross = FALSE 
+)
+```
+
+**Workflow Configuration Commentary:**
+Using `workflow_set` allows for an elegant, non-crossed execution of bespoke configurations. By mapping preprocessors 1:1 to their matching mathematical models, we prevent data leakage and keep our experiment clean, standardized, and fully reproducible.
+
+```{r}
+eval_results <- model_pipelines %>%
+  workflow_map("fit_resamples", resamples = cv_folds, 
+               metrics = metric_set(rmse, mae, rsq), verbose = TRUE)
+
+metrics_summary <- collect_metrics(eval_results)
+print(metrics_summary)
+
+autoplot(eval_results, metric = "rmse") +
+  theme_minimal() +
+  labs(title = "Comparison of RMSE Error Across Architectures", x = "Model Workflow")
+```
+
+**Resampling Performance Analysis:**
+Initial validation results show distinct performance bands. Non-linear, ensemble architectures (Random Forest) and adaptive splines (MARS) demonstrate visibly lower cross-validated RMSE and higher $R^2$ scores compared to the structural baselines (Linear Regression and PCA-restricted SVM). This indicates strong non-linear relationships within the biomass chemical predictors.
+
+```{r}
+fold_performance <- collect_metrics(eval_results, summarize = FALSE)
+
+rf_perf <- fold_performance %>% 
+  filter(wflow_id == "Random_Forest_rf", .metric == "rmse") %>% 
+  pull(.estimate)
+
+mars_perf <- fold_performance %>% 
+  filter(wflow_id == "MARS_mars", .metric == "rmse") %>% 
+  pull(.estimate)
+
+if(length(rf_perf) > 0 & length(mars_perf) > 0) {
+  t_test_result <- t.test(rf_perf, mars_perf, paired = TRUE)
+  print(t_test_result)
+}
+```
+
+Based on the paired t-test conducted to compare the resampling performance (RMSE) of the Random Forest (`Random_Forest_rf`) and MARS (`MARS_mars`) models, we can draw the following conclusions:
+
+-   **Statistical Significance:** The paired t-test reveals a statistically significant difference in performance between the two models ($t(9) = -2.683$, $p = 0.025$). Since the p-value ($0.025$) is less than the standard significance level of $\alpha = 0.05$, we reject the null hypothesis ($H_0$) that there is no difference in the mean RMSE between the models.
+
+-   **Effect Size and Direction:** The estimated mean difference in RMSE is $-0.207$. The negative value indicates that the Random Forest model achieves a lower average RMSE than the MARS model across the cross-validation folds, demonstrating superior predictive accuracy.
+
+-   **Confidence Interval:** The 95% confidence interval for the true mean difference ranges from $-0.382$ to $-0.033$. Because this interval does not contain $0$, it further confirms that the performance advantage of the Random Forest model is robust and not due to random resampling variation.
+
+> **Final Choice:** Since Random Forest significantly outperforms MARS with statistical backing, it is selected as our final architecture to be deployed on the unseen test holdout set.
+
+```{r}
+best_workflow_id <- "Random_Forest_rf"
+best_wf <- extract_workflow(eval_results, id = best_workflow_id)
+
+final_fit <- last_fit(best_wf, split = data_split, metrics = metric_set(rmse, mae, rsq))
+collect_metrics(final_fit)
+
+final_fit %>%
+  collect_predictions() %>%
+  ggplot(aes(x = HHV, y = .pred)) +
+  geom_point(alpha = 0.5, color = "darkblue") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(
+  title = "Predicted vs Actual Values (Test Set)",
+  x = "Actual HHV",
+  y = "Predicted HHV"
+)
+```
+
+**Final Evaluation & Generalization:**
+The final Random Forest model evaluated on the completely unseen testing holdout set exhibits metrics ($RMSE$, $MAE$, $R^2$) that closely mirror those obtained during the cross-validation resampling phase. This consistency proves that the pipeline successfully generalized the underlying statistical features of the biomass dataset without suffering from overfitting. The prediction scatter plot closely tracks the perfect $y = x$ reference line, confirming reliable accuracy across the entire spectrum of HHV values.

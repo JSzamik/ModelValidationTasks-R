@@ -1,0 +1,17 @@
+# Bazy danych (wielkie pliki z danymi)
+*.csv
+*.xlsx
+
+# Pliki środowiska i tymczasowe (widoczne na Twoim screenie jako .RData, .Rhistory)
+.RData
+.Rhistory
+.RDataTmp
+.Rproj.user/
+.ipynb_checkpoints/
+
+# Wyrenderowane raporty HTML (jeśli chcesz wrzucać na gita tylko czyste kody .qmd)
+*.html
+
+# Pliki systemowe Maca/Windowsa (często tworzą się same w folderach)
+.DS_Store
+Thumbs.db
